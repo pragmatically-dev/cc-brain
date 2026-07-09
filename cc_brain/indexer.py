@@ -52,6 +52,18 @@ def _half_life_days(source_name: str, kind: str) -> float:
     return RECENCY_HALF_LIFE_DAYS.get(kind, _DEFAULT_RECENCY_HALF_LIFE_DAYS)
 
 
+# Implicit relevance feedback: every get(ids) after a search() is a free
+# positive signal. log1p saturates so a handful of old, frequently-reused
+# chunks can't drown out genuine relevance; the hard cap keeps the bonus from
+# ever dominating the fused RRF + trust + recency terms above it.
+_USES_BONUS_SCALE = 0.01
+_USES_BONUS_CAP = 0.04
+
+
+def _uses_bonus(uses: int) -> float:
+    return min(_USES_BONUS_SCALE * math.log1p(max(0, uses)), _USES_BONUS_CAP)
+
+
 def _supported_models() -> dict[str, int]:
     from fastembed import TextEmbedding
     out = {}
@@ -497,7 +509,7 @@ def search(query: str, k: int = 6, source: str = "", project: str = "", lex: boo
     candidates: list[tuple[float, int, tuple]] = []
     for cid, score in fused.items():
         row = con.execute(
-            "SELECT source, path, loc, title, text, project, trust, mtime FROM chunks WHERE id=?", (cid,)
+            "SELECT source, path, loc, title, text, project, trust, mtime, uses FROM chunks WHERE id=?", (cid,)
         ).fetchone()
         if not row:
             continue
@@ -507,7 +519,12 @@ def search(query: str, k: int = 6, source: str = "", project: str = "", lex: boo
             continue
         age_days = max(0.0, (now - float(row[7] or 0.0)) / 86400.0) if row[7] else 999.0
         half_life = _half_life_days(row[0], kind_by_source.get(row[0], ""))
-        adjusted = float(score) + 0.02 * float(row[6] or 1.0) + 0.015 * math.exp(-math.log(2) * age_days / half_life)
+        adjusted = (
+            float(score)
+            + 0.02 * float(row[6] or 1.0)
+            + 0.015 * math.exp(-math.log(2) * age_days / half_life)
+            + _uses_bonus(int(row[8] or 0))
+        )
         candidates.append((adjusted, cid, row))
     candidates.sort(key=lambda x: -x[0])
 
@@ -551,6 +568,12 @@ def get(ids: list[int], p: BrainPaths | None = None) -> list[SearchHit]:
     ids = list(ids)[:24]
     p = p or paths()
     con = connect(p)
+    if ids:
+        # Implicit relevance feedback: a get() after a search() is a free
+        # positive signal, folded into search()'s uses bonus.
+        placeholders = ",".join("?" * len(ids))
+        con.execute(f"UPDATE chunks SET uses = uses + 1 WHERE id IN ({placeholders})", [int(i) for i in ids])
+        con.commit()
     out: list[SearchHit] = []
     for cid in ids:
         row = con.execute("SELECT source, path, loc, title, text, project FROM chunks WHERE id=?", (int(cid),)).fetchone()
@@ -564,12 +587,17 @@ def stats(p: BrainPaths | None = None) -> dict:
     con = connect(p)
     per_source = {r[0]: r[1] for r in con.execute("SELECT source, COUNT(*) FROM chunks GROUP BY source ORDER BY 2 DESC")}
     per_project = {r[0] or "-": r[1] for r in con.execute("SELECT project, COUNT(*) FROM chunks GROUP BY project ORDER BY 2 DESC LIMIT 30")}
+    top_used = [
+        {"id": r[0], "path": r[1], "uses": r[2]}
+        for r in con.execute("SELECT id, path, uses FROM chunks WHERE uses > 0 ORDER BY uses DESC LIMIT 5")
+    ]
     return {
         "chunks": con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0],
         "files": con.execute("SELECT COUNT(*) FROM files").fetchone()[0],
         "embeddings": con.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0],
         "per_source": per_source,
         "per_project": per_project,
+        "top_used": top_used,
         "db_bytes": p.db.stat().st_size if p.db.exists() else 0,
         "tv_bytes": p.tv.stat().st_size if p.tv.exists() else 0,
         "embed_model": meta_get(con, "embed_model") or embed_model(),

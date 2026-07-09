@@ -9,6 +9,7 @@ on the two real kinds plus a default for any future custom kind.
 """
 from __future__ import annotations
 
+import sqlite3
 import time
 
 import numpy as np
@@ -178,3 +179,105 @@ def test_half_life_days_resolution_order():
     assert indexer._half_life_days("random-md-source", "md") == pytest.approx(21.0)
     # 3. no source-name and no kind match -> default.
     assert indexer._half_life_days("random-md-source", "unknown-kind") == pytest.approx(30.0)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 -- implicit relevance feedback via get() usage counts
+# ---------------------------------------------------------------------------
+
+def test_get_increments_uses(brain_home):
+    p = brain_home
+    con = connect(p)
+    make_chunk(con, 1, "notes", "", "alpha", trust=1.0, mtime=time.time(), path="a.md")
+    make_chunk(con, 2, "notes", "", "beta", trust=1.0, mtime=time.time(), path="b.md")
+    con.commit()
+
+    indexer.get([1], p=p)
+    indexer.get([1, 2], p=p)
+
+    con = connect(p)
+    uses = {r[0]: r[1] for r in con.execute("SELECT id, uses FROM chunks")}
+    assert uses[1] == 2, "id 1 was requested in two separate get() calls"
+    assert uses[2] == 1, "id 2 was requested in one get() call"
+
+
+def test_uses_bonus_ranks_higher_uses_above_at_equal_score(brain_home, monkeypatch):
+    """Two chunks, equal fused RRF score, equal age/kind (both 'notes').
+    Pre-fix there is no uses bonus, so a tie stable-sorts by fused-dict
+    insertion order; post-fix the uses=20 chunk must win regardless of that
+    insertion order."""
+    p = brain_home
+    con = connect(p)
+    now = time.time()
+    make_chunk(con, 1, "notes", "", "alpha", trust=1.0, mtime=now, path="a.md")
+    make_chunk(con, 2, "notes", "", "beta", trust=1.0, mtime=now, path="b.md")
+    con.commit()
+    con.execute("UPDATE chunks SET uses=20 WHERE id=2")
+    con.commit()
+
+    # id=1 (uses=0) inserted first via the vec leg -- pre-fix tie would list
+    # it first; must flip to [2, 1] once the log1p(uses) bonus exists.
+    monkeypatch.setattr(indexer, "_vec_search", lambda query, limit, p: [(1, 0.0)])
+    monkeypatch.setattr(indexer, "_bm25", lambda con, tokens, limit, project="", source="": [(2, 0.0)])
+
+    hits = indexer.search("q", k=2, p=p)
+    ids = [h.id for h in hits]
+    assert ids == [2, 1], f"uses=20 chunk should outrank uses=0 at equal score/age, got {ids}"
+
+
+def test_uses_bonus_is_capped():
+    assert indexer._uses_bonus(0) == 0.0
+    assert indexer._uses_bonus(10**6) == pytest.approx(0.04)
+    assert indexer._uses_bonus(5) < indexer._uses_bonus(20) <= 0.04
+
+
+def test_stats_reports_top_used(brain_home):
+    p = brain_home
+    con = connect(p)
+    make_chunk(con, 1, "notes", "", "a", path="a.md")
+    make_chunk(con, 2, "notes", "", "b", path="b.md")
+    make_chunk(con, 3, "notes", "", "c", path="c.md")
+    con.commit()
+    con.execute("UPDATE chunks SET uses=5 WHERE id=1")
+    con.execute("UPDATE chunks SET uses=9 WHERE id=2")
+    # id=3 stays at uses=0 and must be excluded from top_used.
+    con.commit()
+
+    s = indexer.stats(p=p)
+    top = s["top_used"]
+    assert [t["id"] for t in top] == [2, 1]
+    assert all(t["uses"] > 0 for t in top)
+    assert top[0]["path"] == "b.md"
+
+
+def test_legacy_db_without_uses_column_migrates_on_connect(brain_home):
+    """A pre-v0.4 DB has a chunks table with no uses column. connect() must
+    add it via a tolerant ALTER TABLE, defaulting existing rows to 0."""
+    p = brain_home
+    p.data.mkdir(parents=True, exist_ok=True)
+    legacy = sqlite3.connect(p.db)
+    legacy.execute(
+        """
+        CREATE TABLE chunks(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL,
+            source TEXT NOT NULL,
+            project TEXT,
+            loc TEXT,
+            title TEXT,
+            text TEXT,
+            mtime REAL,
+            trust REAL DEFAULT 1.0
+        )
+        """
+    )
+    legacy.execute(
+        "INSERT INTO chunks(id, path, source, project, loc, title, text, mtime, trust)"
+        " VALUES(1, 'old.md', 's', '', 'L1', 't', 'legacy body', 0, 1.0)"
+    )
+    legacy.commit()
+    legacy.close()
+
+    con = connect(p)
+    row = con.execute("SELECT uses FROM chunks WHERE id=1").fetchone()
+    assert row == (0,), "legacy chunks row must get uses=0 via the tolerant ALTER TABLE migration"

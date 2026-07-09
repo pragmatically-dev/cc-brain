@@ -33,7 +33,8 @@ def connect(p: BrainPaths | None = None) -> sqlite3.Connection:
             title TEXT,
             text TEXT,
             mtime REAL,
-            trust REAL DEFAULT 1.0
+            trust REAL DEFAULT 1.0,
+            uses INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS chunks_source ON chunks(source);
         CREATE INDEX IF NOT EXISTS chunks_project ON chunks(project);
@@ -55,6 +56,12 @@ def connect(p: BrainPaths | None = None) -> sqlite3.Connection:
         );
         """
     )
+    # Pre-v0.4 DBs have a chunks table without `uses`; CREATE TABLE IF NOT
+    # EXISTS above is a no-op for them, so migrate it in tolerantly.
+    try:
+        con.execute("ALTER TABLE chunks ADD COLUMN uses INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     return con
 
 
