@@ -135,3 +135,46 @@ def test_recency_half_life_dict_uses_real_kinds():
     'web', 'memory') which are not real SourceSpec.kind values in this repo."""
     assert set(indexer.RECENCY_HALF_LIFE_DAYS) <= {"md", "code"}
     assert indexer.RECENCY_HALF_LIFE_DAYS.get("code") == pytest.approx(90.0)
+
+
+# ---------------------------------------------------------------------------
+# 1b-bis. Per-source-name recency half-life override
+# ---------------------------------------------------------------------------
+
+def test_recency_half_life_source_name_override_beats_kind(brain_home, monkeypatch):
+    """'notes' (365d via RECENCY_HALF_LIFE_BY_SOURCE) must outrank 'sessions'
+    (14d) even though both share kind='md' and thus the same kind-level
+    half-life -- the source-name override is the intended fast path for
+    "curated note vs session transcript" that kind alone can't express."""
+    p = brain_home
+    con = connect(p)
+    thirty_days_ago = time.time() - 30 * 86400
+
+    make_chunk(con, 1, "sessions", "", "alpha", trust=1.0, mtime=thirty_days_ago, path="s.md")
+    make_chunk(con, 2, "notes", "", "beta", trust=1.0, mtime=thirty_days_ago, path="n.md")
+    con.commit()
+
+    # cid 1 (sessions) inserted into the fused dict first (vec leg) so that,
+    # pre-fix (kind-only resolution, both "md" => tied), a stable sort on the
+    # tie would list it first -- must flip to [2, 1] only once the per-source
+    # override makes notes' recency term genuinely larger.
+    monkeypatch.setattr(indexer, "_vec_search", lambda query, limit, p: [(1, 0.0)])
+    monkeypatch.setattr(indexer, "_bm25", lambda con, tokens, limit, project="", source="": [(2, 0.0)])
+
+    hits = indexer.search("q", k=2, p=p)
+    ids = [h.id for h in hits]
+
+    assert ids == [2, 1], f"source=notes (365d) should outrank source=sessions (14d) at equal age/kind, got {ids}"
+
+
+def test_half_life_days_resolution_order():
+    """_half_life_days(source_name, kind) must resolve source-name override
+    first, then kind, then the 30.0 default -- in that order."""
+    # 1. source-name match wins even against a mismatched/unrelated kind.
+    assert indexer._half_life_days("notes", "md") == pytest.approx(365.0)
+    assert indexer._half_life_days("sessions", "code") == pytest.approx(14.0)
+    # 2. no source-name match -> fall back to kind.
+    assert indexer._half_life_days("some-repo", "code") == pytest.approx(90.0)
+    assert indexer._half_life_days("random-md-source", "md") == pytest.approx(21.0)
+    # 3. no source-name and no kind match -> default.
+    assert indexer._half_life_days("random-md-source", "unknown-kind") == pytest.approx(30.0)

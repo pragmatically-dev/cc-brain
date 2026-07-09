@@ -33,6 +33,24 @@ _EMBEDDER = None
 RECENCY_HALF_LIFE_DAYS: dict[str, float] = {"code": 90.0, "md": 21.0}
 _DEFAULT_RECENCY_HALF_LIFE_DAYS = 30.0
 
+# Per-source-name override, checked before RECENCY_HALF_LIFE_DAYS: kind="md"
+# is too coarse to tell a session transcript (decays fast) apart from a
+# curated note (nearly timeless), since both share kind="md" in
+# config.py's _default_sources(). Keyed on SourceSpec.name.
+RECENCY_HALF_LIFE_BY_SOURCE: dict[str, float] = {
+    "sessions": 14.0,
+    "web": 45.0,
+    "commits": 60.0,
+    "notes": 365.0,
+}
+
+
+def _half_life_days(source_name: str, kind: str) -> float:
+    """Resolve recency half-life: source-name override, then kind, then default."""
+    if source_name in RECENCY_HALF_LIFE_BY_SOURCE:
+        return RECENCY_HALF_LIFE_BY_SOURCE[source_name]
+    return RECENCY_HALF_LIFE_DAYS.get(kind, _DEFAULT_RECENCY_HALF_LIFE_DAYS)
+
 
 def _supported_models() -> dict[str, int]:
     from fastembed import TextEmbedding
@@ -488,7 +506,7 @@ def search(query: str, k: int = 6, source: str = "", project: str = "", lex: boo
         if project and normalize_project(project) != normalize_project(row[5] or ""):
             continue
         age_days = max(0.0, (now - float(row[7] or 0.0)) / 86400.0) if row[7] else 999.0
-        half_life = RECENCY_HALF_LIFE_DAYS.get(kind_by_source.get(row[0], ""), _DEFAULT_RECENCY_HALF_LIFE_DAYS)
+        half_life = _half_life_days(row[0], kind_by_source.get(row[0], ""))
         adjusted = float(score) + 0.02 * float(row[6] or 1.0) + 0.015 * math.exp(-math.log(2) * age_days / half_life)
         candidates.append((adjusted, cid, row))
     candidates.sort(key=lambda x: -x[0])
