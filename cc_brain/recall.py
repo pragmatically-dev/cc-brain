@@ -22,10 +22,9 @@ def format_hits(hits, max_chars: int = 2800) -> str:
 
 def session_start_context(cwd: str | Path, cap: int = 4200) -> str:
     project = project_from_path(Path(cwd))
-    hits = indexer.search("last session next step current status", k=4, source="sessions", project=project, lex=True)
-    if not hits:
+    body = indexer.project_snapshot(project, k=4)
+    if body.startswith("(no memory"):
         return ""
-    body = format_hits(hits, cap)
     return (
         f"[cc-brain] Persistent memory for {project}. Use the cc-brain MCP search/get tools for drill-down.\n"
         f"{body}"

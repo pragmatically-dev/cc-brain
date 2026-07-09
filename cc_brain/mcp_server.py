@@ -7,11 +7,14 @@ import time
 from mcp.server.fastmcp import FastMCP
 
 from . import __version__
-from .config import load_sources, paths, slug
+from .config import load_sources, paths
 from .indexer import doctor as run_doctor
 from .indexer import get as get_chunks
 from .indexer import index as run_index
-from .indexer import register_repo, search as run_search
+from .indexer import project_snapshot, register_repo, search as run_search
+from .indexer import recent as run_recent
+from .indexer import remove_source as run_remove_source
+from .indexer import stats as run_stats
 from .memory import write_note
 from .store import dirty_info
 from .web import capture_web
@@ -20,19 +23,27 @@ from .web import capture_web
 mcp = FastMCP("cc-brain")
 _LOCK = threading.Lock()
 _LAST_INDEX = 0.0
+_REFRESHING = False
 
 
 def _index_if_dirty() -> str:
-    global _LAST_INDEX
+    global _LAST_INDEX, _REFRESHING
     info = dirty_info()
-    if not info:
+    if not info or _REFRESHING or time.time() - _LAST_INDEX < 30:
         return ""
-    with _LOCK:
-        if time.time() - _LAST_INDEX < 2:
-            return ""
-        out = run_index()
-        _LAST_INDEX = time.time()
-        return out
+    def _run():
+        global _LAST_INDEX, _REFRESHING
+        try:
+            with _LOCK:
+                run_index()
+                _LAST_INDEX = time.time()
+        except Exception:
+            pass
+        finally:
+            _REFRESHING = False
+    _REFRESHING = True
+    threading.Thread(target=_run, daemon=True).start()
+    return "(vault dirty: index refresh started in background; results may be a few seconds stale)"
 
 
 @mcp.tool()
@@ -98,7 +109,10 @@ def add_repo(path: str, name: str = "", project: str = "") -> str:
 @mcp.tool()
 def add_web(url: str, project: str = "") -> str:
     """Fetch and persist a web page into the ingest/web source."""
-    path = capture_web(url, project=project)
+    try:
+        path = capture_web(url, project=project)
+    except Exception as exc:
+        return f"failed to capture {url}: {exc}"
     return f"captured {url} -> {path}"
 
 
@@ -113,15 +127,35 @@ def sources() -> str:
 
 @mcp.tool()
 def project_state(project: str, k: int = 8) -> str:
-    """Return freshest/current chunks for a project."""
-    q = f"{slug(project)} current status next step handoff checkpoint recent"
-    return search(q, k=k, project=project)
+    """Freshest project memory: newest session atom + recent commits + related chunks."""
+    note = _index_if_dirty()
+    body = project_snapshot(project, k=k)
+    return (note + "\n" if note else "") + body
 
 
 @mcp.tool()
 def doctor() -> str:
     """Check source roots, chunk counts, embeddings and turbovec availability."""
     return json.dumps(run_doctor(), indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def stats() -> str:
+    """Brain size and freshness: chunks per source/project, model, last index time."""
+    return json.dumps(run_stats(), indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def recent(project: str = "", limit: int = 10) -> str:
+    """Most recently indexed files, newest first. Good freshness probe."""
+    rows = run_recent(project, limit)
+    return "\n".join(f"{r['source']}:{r['path']} project={r['project'] or '-'}" for r in rows) or "(empty)"
+
+
+@mcp.tool()
+def remove_source(name: str) -> str:
+    """Unregister a source and delete its chunks from the brain."""
+    return run_remove_source(name)
 
 
 def main() -> None:

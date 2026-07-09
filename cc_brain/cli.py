@@ -6,8 +6,8 @@ import sys
 
 from . import __version__
 from .config import load_sources, paths
-from .indexer import doctor, get, index, register_repo, search
-from .installer import install, mcp_command
+from .indexer import doctor, get, index, project_snapshot, recent, register_repo, remove_source, search, stats
+from .installer import install, mcp_command, uninstall
 from .memory import capture_transcript, write_note
 from .runtime import status as runtime_status, vendor_gpu_runtime
 from .web import capture_web
@@ -67,6 +67,21 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("mcp-command")
     sub.add_parser("mcp")
 
+    sub.add_parser("stats")
+    sub.add_parser("uninstall")
+
+    p_recent = sub.add_parser("recent")
+    p_recent.add_argument("--project", default="")
+    p_recent.add_argument("-n", type=int, default=10)
+
+    p_rm = sub.add_parser("remove-source")
+    p_rm.add_argument("name")
+
+    sub.add_parser("notes")
+
+    p_state = sub.add_parser("project-state")
+    p_state.add_argument("project")
+
     args = parser.parse_args(argv)
     if args.cmd == "doctor":
         print(json.dumps(doctor(), indent=2, ensure_ascii=False))
@@ -108,6 +123,21 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "mcp":
         from .mcp_server import main as mcp_main
         mcp_main()
+    elif args.cmd == "stats":
+        print(json.dumps(stats(), indent=2, ensure_ascii=False))
+    elif args.cmd == "recent":
+        for row in recent(args.project, args.n):
+            print(f"{row['mtime']:.0f}  {row['source']:14s} {row['project']:20s} {row['path']}")
+    elif args.cmd == "remove-source":
+        print(remove_source(args.name))
+    elif args.cmd == "notes":
+        for f in sorted(paths().notes.glob("*.md")):
+            first = f.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+            print(f"{f.stem}: {first[0][:100] if first else ''}")
+    elif args.cmd == "project-state":
+        print(project_snapshot(args.project))
+    elif args.cmd == "uninstall":
+        print(f"removed cc-brain hooks from {uninstall()}")
     return 0
 
 

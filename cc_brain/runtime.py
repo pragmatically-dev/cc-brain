@@ -10,8 +10,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_VENDOR = REPO_ROOT / "vendor" / "python"
+def _default_vendor() -> Path:
+    root = Path(__file__).resolve().parents[1]
+    if (root / "pyproject.toml").exists():
+        return root / "vendor" / "python"
+    import os as _os
+    home = Path(_os.environ.get("CC_BRAIN_HOME", "~/.cc-brain")).expanduser()
+    return home / "vendor" / "python"
+
+
 CUDA_WHEELS = (
     "onnxruntime-gpu",
     "nvidia-cuda-runtime-cu12",
@@ -39,7 +46,7 @@ def device_mode() -> str:
 
 
 def vendor_dir() -> Path:
-    return Path(os.environ.get("CC_BRAIN_VENDOR_DIR", str(DEFAULT_VENDOR))).expanduser().resolve()
+    return Path(os.environ.get("CC_BRAIN_VENDOR_DIR", str(_default_vendor()))).expanduser().resolve()
 
 
 def has_nvidia_gpu() -> bool:

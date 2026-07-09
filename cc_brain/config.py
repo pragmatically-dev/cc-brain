@@ -11,7 +11,11 @@ from .contracts import SourceSpec
 
 DEFAULT_INCLUDE = SourceSpec("x", Path(".")).include
 DEFAULT_EXCLUDE = SourceSpec("x", Path(".")).exclude
-REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _repo_root() -> Path | None:
+    root = Path(__file__).resolve().parents[1]
+    return root if (root / "pyproject.toml").exists() else None
 
 
 @dataclass(frozen=True)
@@ -44,7 +48,7 @@ def paths() -> BrainPaths:
         notes=home / "notes",
         commits=home / "commits",
         ingest=home / "ingest",
-        private_ingest=REPO_ROOT / "ingest",
+        private_ingest=(_repo_root() / "ingest") if _repo_root() else home / "private-ingest",
         web=home / "ingest" / "web",
         memories=memories,
         l0=memories / "l0" / "conversations",
