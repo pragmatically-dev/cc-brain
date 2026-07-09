@@ -40,6 +40,8 @@ the trail of decisions made across days or weeks.
 | Privacy controls | Documents Claude Code data policy implications and prints safe opt-out env vars. |
 | No usage monitor | No invasive quota/context monitoring. |
 | No worker farm | No local LLM fleet dependency; the product is memory/retrieval only. |
+| v0.4 ranking model | RRF fusion blended with trust, per-source recency half-life, implicit `get()`-usage feedback, and a personalized-PageRank pass over a memory graph (chunk chains, wikilinks, session links); MMR keeps final results diverse instead of near-duplicate. |
+| Near-duplicate detection | `cc-brain dedupe` reports (never deletes) cross-file chunks that are near-identical by embedding cosine similarity; `doctor()` warns when a sample looks duplicate-heavy. |
 
 ## Architecture
 
@@ -209,6 +211,7 @@ cc-brain recent [--project name] [-n 10]
 cc-brain remove-source source-name
 cc-brain notes
 cc-brain project-state project-name
+cc-brain dedupe [--threshold 0.95] [--limit 50]
 cc-brain bootstrap-gpu
 cc-brain privacy-env
 cc-brain install

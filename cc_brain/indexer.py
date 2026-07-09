@@ -169,8 +169,13 @@ def _embedder():
     return _EMBEDDER
 
 
-def embedder_providers() -> list[str]:
-    model = _embedder()
+def embedder_providers(init: bool = True) -> list[str]:
+    if _EMBEDDER is None:
+        if not init:
+            return []
+        model = _embedder()
+    else:
+        model = _EMBEDDER
     try:
         return list(model.model.model.get_providers())
     except Exception:
@@ -814,6 +819,46 @@ def recent(project: str = "", limit: int = 10, p: BrainPaths | None = None) -> l
     return [{"source": r[0], "path": r[1], "project": r[2] or "", "mtime": r[3]} for r in con.execute(q, args)]
 
 
+_SNAPSHOT_RELATED_BUDGET = 4000
+_SNAPSHOT_RELATED_POOL_MULT = 4
+
+
+def _pack_related_chunks(con, hits: list[SearchHit], k: int, budget: int = _SNAPSHOT_RELATED_BUDGET, lam: float = 0.7) -> list[SearchHit]:
+    """Greedy MMR + character-budget packing for project_snapshot's related-
+    chunk candidates (reuses _mmr, same pattern as search()'s own MMR pool).
+
+    Falls back to the current flat top-k (`hits[:k]`, budget ignored) exactly
+    as before when none of the candidates has a stored embedding.
+    """
+    if not hits:
+        return []
+    ids = [h.id for h in hits]
+    placeholders = ",".join("?" * len(ids))
+    vecs: dict[int, "object"] = {}
+    rows_v = con.execute(f"SELECT chunk, vec FROM embeddings WHERE chunk IN ({placeholders})", ids).fetchall()
+    if rows_v:
+        import numpy as np
+        for cid, raw in rows_v:
+            arr = np.frombuffer(raw, dtype=np.float32)
+            norm = float(np.linalg.norm(arr))
+            vecs[cid] = arr / norm if norm > 0 else arr
+    if not vecs:
+        return hits[:k]
+
+    candidates = [(h.score, h.id, h) for h in hits]
+    ordered = _mmr(candidates, vecs, k=len(candidates), lam=lam)
+
+    selected: list[SearchHit] = []
+    total_len = 0
+    for _, _, hit in ordered:
+        text_len = len(hit.text)
+        if total_len + text_len > budget:
+            continue
+        selected.append(hit)
+        total_len += text_len
+    return selected
+
+
 def project_snapshot(project: str, k: int = 8, p: BrainPaths | None = None) -> str:
     p = p or paths()
     con = connect(p)
@@ -830,10 +875,13 @@ def project_snapshot(project: str, k: int = 8, p: BrainPaths | None = None) -> s
     if commit_log.exists():
         tail = commit_log.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-12:]
         parts.append("## Recent commits\n" + "\n".join(tail))
-    hits = search(f"{proj} current status next step handoff", k=k, project=proj, lex=True, p=p)
+    pool_k = max(_SNAPSHOT_RELATED_POOL_MULT * k, 24)
+    hits = search(f"{proj} current status next step handoff", k=pool_k, project=proj, lex=True, p=p)
     if hits:
-        lines = [f"- [{h.id}] {h.source}:{h.path}#{h.loc} " + " ".join(h.text.split())[:200] for h in hits]
-        parts.append("## Related chunks (use get(ids) to expand)\n" + "\n".join(lines))
+        related = _pack_related_chunks(con, hits, k=k)
+        if related:
+            lines = [f"- [{h.id}] {h.source}:{h.path}#{h.loc} " + " ".join(h.text.split())[:200] for h in related]
+            parts.append("## Related chunks (use get(ids) to expand)\n" + "\n".join(lines))
     return "\n\n".join(parts) if parts else f"(no memory for project {proj!r} yet — index first?)"
 
 
@@ -860,6 +908,91 @@ def remove_source(name: str, p: BrainPaths | None = None) -> str:
     return f"removed source {name!r} ({len(ids)} chunks)"
 
 
+_DEDUPE_BLOCK = 512
+
+
+def find_near_duplicates(
+    threshold: float = 0.95,
+    limit: int = 50,
+    p: BrainPaths | None = None,
+    cids: list[int] | None = None,
+    con=None,
+) -> list[tuple[int, str, int, str, float]]:
+    """Cross-path near-duplicate report over stored embeddings. Read-only --
+    never deletes anything.
+
+    Compares embeddings block x block (512 rows at a time) via a dense numpy
+    matrix product of L2-normalized vectors. Reports only pairs with
+    cos > threshold AND differing chunk path (same-path chunks -- e.g.
+    adjacent sections of one file -- are expected to be similar and are not
+    duplicates). `cids` restricts the comparison to a subset (used by
+    doctor()'s sampled check); `con` lets a caller reuse an open connection.
+    Returns (cid_a, path_a, cid_b, path_b, cos), sorted by cos desc, capped
+    at `limit`.
+    """
+    p = p or paths()
+    con = con or connect(p)
+    if cids is not None:
+        if not cids:
+            return []
+        placeholders = ",".join("?" * len(cids))
+        rows = con.execute(
+            f"SELECT chunk, vec FROM embeddings WHERE chunk IN ({placeholders}) ORDER BY chunk", cids
+        ).fetchall()
+    else:
+        rows = con.execute("SELECT chunk, vec FROM embeddings ORDER BY chunk").fetchall()
+    if len(rows) < 2:
+        return []
+
+    import numpy as np
+    ids = [r[0] for r in rows]
+    dim = len(rows[0][1]) // 4
+    mat = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float32).reshape(len(rows), dim).astype(np.float64)
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    mat = mat / norms
+
+    path_by_id: dict[int, str] = {}
+    for i in range(0, len(ids), 500):
+        batch = ids[i:i + 500]
+        q = ",".join("?" * len(batch))
+        for cid, path in con.execute(f"SELECT id, path FROM chunks WHERE id IN ({q})", batch):
+            path_by_id[cid] = path
+
+    n = len(ids)
+    out: list[tuple[int, str, int, str, float]] = []
+    for bi in range(0, n, _DEDUPE_BLOCK):
+        a_end = min(bi + _DEDUPE_BLOCK, n)
+        block_a = mat[bi:a_end]
+        for bj in range(bi, n, _DEDUPE_BLOCK):
+            b_end = min(bj + _DEDUPE_BLOCK, n)
+            block_b = mat[bj:b_end]
+            sims = block_a @ block_b.T
+            for ia in range(sims.shape[0]):
+                gi = bi + ia
+                jb_start = (ia + 1) if bj == bi else 0
+                for jb in range(jb_start, sims.shape[1]):
+                    gj = bj + jb
+                    cos = float(sims[ia, jb])
+                    if cos <= threshold:
+                        continue
+                    cid_a, cid_b = ids[gi], ids[gj]
+                    path_a = path_by_id.get(cid_a, "")
+                    path_b = path_by_id.get(cid_b, "")
+                    if path_a == path_b:
+                        continue
+                    out.append((cid_a, path_a, cid_b, path_b, cos))
+    out.sort(key=lambda x: -x[4])
+    return out[:limit]
+
+
+def _random_embedded_cids(con, limit: int = 256) -> list[int]:
+    """Random sample of chunk ids that have a stored embedding, for doctor()'s
+    cheap duplicate-content check. A separate function so tests can inject a
+    deterministic sample instead of depending on real ORDER BY RANDOM()."""
+    return [r[0] for r in con.execute("SELECT chunk FROM embeddings ORDER BY RANDOM() LIMIT ?", (limit,))]
+
+
 def doctor(p: BrainPaths | None = None) -> dict:
     p = p or paths()
     con = connect(p)
@@ -870,10 +1003,10 @@ def doctor(p: BrainPaths | None = None) -> dict:
     vec_ok = vector_available()
     providers: list[str] = []
     provider_warning = ""
-    rt = runtime_status()
+    rt = runtime_status(preload=False)
     if vec_ok:
         try:
-            providers = embedder_providers()
+            providers = embedder_providers(init=False)
             if providers and "CUDAExecutionProvider" not in providers and device_mode() == "auto" and rt.gpu_detected:
                 provider_warning = "CUDAExecutionProvider not active; turbovec works but embedding will be slower"
         except Exception as exc:
@@ -896,6 +1029,15 @@ def doctor(p: BrainPaths | None = None) -> dict:
     last_refresh_error = meta_get(con, "last_refresh_error")
     if last_refresh_error:
         warnings.append(f"last background index refresh FAILED: {last_refresh_error}")
+    if embedded >= 2:
+        # Sampled, not exhaustive: dedupe over the whole corpus is a
+        # deliberate `cc-brain dedupe` action, not something doctor() should
+        # pay for on every call. Compares vectors already on disk -- never
+        # touches the embedder.
+        sample = _random_embedded_cids(con, 256)
+        dup_pairs = find_near_duplicates(threshold=0.95, limit=10_000, con=con, cids=sample)
+        if len(dup_pairs) > 20:
+            warnings.append("possible duplicate content; run cc-brain dedupe")
     return {
         "home": str(p.home),
         "sources": len(sources),

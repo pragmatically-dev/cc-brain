@@ -448,3 +448,172 @@ def test_personalized_pagerank_hand_calculable_one_iteration():
     assert result[1] == pytest.approx(0.2875)
     assert result[2] == pytest.approx(0.425)
     assert result[3] == pytest.approx(0.2875)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4a -- near-duplicate detection (find_near_duplicates / cc-brain dedupe)
+# ---------------------------------------------------------------------------
+
+def test_find_near_duplicates_finds_planted_pair_cross_path(brain_home):
+    p = brain_home
+    con = connect(p)
+    make_chunk(con, 1, "notes", "", "alpha", path="a.md")
+    make_chunk(con, 2, "notes", "", "beta", path="b.md")
+    make_chunk(con, 3, "notes", "", "gamma", path="c.md")
+    con.commit()
+    _embed(con, 1, [1, 0, 0, 0])
+    _embed(con, 2, [1, 0, 0, 0])  # near-identical to 1, different path
+    _embed(con, 3, [0, 1, 0, 0])  # orthogonal, no match
+    con.commit()
+
+    pairs = indexer.find_near_duplicates(threshold=0.95, limit=50, p=p)
+    assert len(pairs) == 1
+    cid_a, path_a, cid_b, path_b, cos = pairs[0]
+    assert {cid_a, cid_b} == {1, 2}
+    assert cos == pytest.approx(1.0)
+
+
+def test_find_near_duplicates_ignores_same_path_and_self_pairs(brain_home):
+    p = brain_home
+    con = connect(p)
+    make_chunk(con, 1, "notes", "", "alpha one", path="same.md")
+    make_chunk(con, 2, "notes", "", "alpha two", path="same.md")  # same path as 1
+    con.commit()
+    _embed(con, 1, [1, 0, 0, 0])
+    _embed(con, 2, [1, 0, 0, 0])
+    con.commit()
+
+    pairs = indexer.find_near_duplicates(threshold=0.95, limit=50, p=p)
+    assert pairs == [], "same-path chunks must never be reported, even if their embeddings are identical"
+
+
+def test_find_near_duplicates_respects_threshold(brain_home):
+    p = brain_home
+    con = connect(p)
+    make_chunk(con, 1, "notes", "", "a", path="a.md")
+    make_chunk(con, 2, "notes", "", "b", path="b.md")
+    con.commit()
+    _embed(con, 1, [1.0, 0.0, 0.0, 0.0])
+    _embed(con, 2, [0.9, (1 - 0.81) ** 0.5, 0.0, 0.0])  # cos(1, 2) == 0.9 exactly
+    con.commit()
+
+    assert indexer.find_near_duplicates(threshold=0.95, limit=50, p=p) == []
+    pairs = indexer.find_near_duplicates(threshold=0.85, limit=50, p=p)
+    assert len(pairs) == 1
+    assert pairs[0][4] == pytest.approx(0.9)
+
+
+def test_find_near_duplicates_respects_limit(brain_home):
+    p = brain_home
+    con = connect(p)
+    # 4 chunks, all pairwise-identical embeddings, distinct paths -> C(4,2)=6 candidate pairs.
+    for i in range(1, 5):
+        make_chunk(con, i, "notes", "", f"chunk {i}", path=f"f{i}.md")
+    con.commit()
+    for i in range(1, 5):
+        _embed(con, i, [1, 0, 0, 0])
+    con.commit()
+
+    pairs = indexer.find_near_duplicates(threshold=0.95, limit=3, p=p)
+    assert len(pairs) == 3
+
+
+def test_doctor_warns_on_many_duplicates_in_sample(brain_home, monkeypatch):
+    """This compares vectors already on disk (find_near_duplicates never
+    touches _embedder -- see its source: only SELECTs from `embeddings`).
+    The sample is injected via _random_embedded_cids (monkeypatched here)
+    instead of relying on real ORDER BY RANDOM()."""
+    p = brain_home
+    con = connect(p)
+    n = 7  # C(7,2) = 21 pairs > the 20-pair warning threshold, all identical.
+    for i in range(1, n + 1):
+        make_chunk(con, i, "notes", "", f"chunk {i}", path=f"f{i}.md")
+    con.commit()
+    for i in range(1, n + 1):
+        _embed(con, i, [1, 0, 0, 0])
+    con.commit()
+
+    sample = list(range(1, n + 1))
+    monkeypatch.setattr(indexer, "_random_embedded_cids", lambda con, limit=256: sample)
+
+    report = indexer.doctor(p=p)
+    assert any("duplicate" in w for w in report["warnings"])
+
+
+def test_doctor_no_warning_for_clean_corpus(brain_home, monkeypatch):
+    p = brain_home
+    con = connect(p)
+    make_chunk(con, 1, "notes", "", "alpha", path="a.md")
+    make_chunk(con, 2, "notes", "", "beta", path="b.md")
+    con.commit()
+    _embed(con, 1, [1, 0, 0, 0])
+    _embed(con, 2, [0, 1, 0, 0])
+    con.commit()
+
+    monkeypatch.setattr(indexer, "_random_embedded_cids", lambda con, limit=256: [1, 2])
+
+    report = indexer.doctor(p=p)
+    assert not any("duplicate" in w for w in report["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# Phase 4b -- submodular packing of project_snapshot's related chunks
+# ---------------------------------------------------------------------------
+
+def test_pack_related_chunks_prefers_diverse_over_duplicate_when_budget_forces_a_cut(brain_home):
+    """Same shape as the Phase 1 MMR test: 3 near-duplicate embeddings + 1
+    orthogonal. Padded to ~1200 chars each so the 4000-char budget can only
+    fit 3 of the 4 -- the diversity-aware reorder must keep the orthogonal
+    chunk and drop the weakest (3rd) duplicate instead of a flat top-3 cut."""
+    p = brain_home
+    con = connect(p)
+    _embed(con, 1, [1, 0, 0, 0])
+    _embed(con, 2, [1, 0, 0, 0])
+    _embed(con, 3, [1, 0, 0, 0])
+    _embed(con, 4, [0, 1, 0, 0])
+    con.commit()
+
+    pad = "x" * 1200
+    hits = [
+        indexer.SearchHit(1, 0.04, "notes", "p1.md", "L1", "t", pad, ""),
+        indexer.SearchHit(2, 0.03, "notes", "p2.md", "L1", "t", pad, ""),
+        indexer.SearchHit(3, 0.02, "notes", "p3.md", "L1", "t", pad, ""),
+        indexer.SearchHit(4, 0.01, "notes", "p4.md", "L1", "t", pad, ""),
+    ]
+
+    selected = indexer._pack_related_chunks(con, hits, k=4)
+    ids = [h.id for h in selected]
+    assert 4 in ids, f"budget-constrained packing must keep the diverse chunk, got {ids}"
+    assert 3 not in ids, f"the weakest near-duplicate should be dropped first, got {ids}"
+    assert sum(len(h.text) for h in selected) <= 4000
+
+
+def test_pack_related_chunks_respects_budget(brain_home):
+    p = brain_home
+    con = connect(p)
+    for i in range(1, 4):
+        _embed(con, i, [float(i), 0, 0, 0])
+    con.commit()
+
+    big = "y" * 2500
+    hits = [
+        indexer.SearchHit(1, 0.03, "notes", "a.md", "L1", "t", big, ""),
+        indexer.SearchHit(2, 0.02, "notes", "b.md", "L1", "t", big, ""),
+        indexer.SearchHit(3, 0.01, "notes", "c.md", "L1", "t", big, ""),
+    ]
+    selected = indexer._pack_related_chunks(con, hits, k=3)
+    assert len(selected) < len(hits), "large chunks must not all fit under the 4000-char budget"
+    assert sum(len(h.text) for h in selected) <= 4000
+
+
+def test_pack_related_chunks_falls_back_without_embeddings(brain_home):
+    p = brain_home
+    con = connect(p)
+    # No embeddings inserted at all for these ids.
+    hits = [
+        indexer.SearchHit(1, 0.04, "notes", "a.md", "L1", "t", "x" * 3000, ""),
+        indexer.SearchHit(2, 0.03, "notes", "b.md", "L1", "t", "y" * 3000, ""),
+        indexer.SearchHit(3, 0.02, "notes", "c.md", "L1", "t", "z" * 3000, ""),
+    ]
+    selected = indexer._pack_related_chunks(con, hits, k=2)
+    assert [h.id for h in selected] == [1, 2], "no embeddings -> fall back to the flat top-k, budget ignored"

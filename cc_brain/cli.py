@@ -5,11 +5,23 @@ import json
 
 from . import __version__
 from .config import load_sources, paths
-from .indexer import doctor, get, index, project_snapshot, recent, register_repo, remove_source, search, stats
+from .indexer import (
+    doctor,
+    find_near_duplicates,
+    get,
+    index,
+    project_snapshot,
+    recent,
+    register_repo,
+    remove_source,
+    search,
+    stats,
+)
 from .installer import install, mcp_command, uninstall
 from .memory import capture_transcript, write_note
 from .runtime import status as runtime_status
 from .runtime import vendor_gpu_runtime
+from .store import connect
 from .web import capture_web
 
 
@@ -82,6 +94,10 @@ def main(argv: list[str] | None = None) -> int:
     p_state = sub.add_parser("project-state")
     p_state.add_argument("project")
 
+    p_dedupe = sub.add_parser("dedupe")
+    p_dedupe.add_argument("--threshold", type=float, default=0.95)
+    p_dedupe.add_argument("--limit", type=int, default=50)
+
     args = parser.parse_args(argv)
     if args.cmd == "doctor":
         print(json.dumps(doctor(), indent=2, ensure_ascii=False))
@@ -136,6 +152,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{f.stem}: {first[0][:100] if first else ''}")
     elif args.cmd == "project-state":
         print(project_snapshot(args.project))
+    elif args.cmd == "dedupe":
+        con = connect(paths())
+        total_embedded = con.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+        if total_embedded == 0:
+            print("(no embeddings indexed yet -- run cc-brain index first)")
+        else:
+            pairs = find_near_duplicates(threshold=args.threshold, limit=args.limit, con=con)
+            for cid_a, path_a, cid_b, path_b, cos in pairs:
+                print(f"[{cid_a}] {path_a} ~ [{cid_b}] {path_b} ({cos:.3f})")
+            print(f"{len(pairs)} candidate duplicate pairs (threshold {args.threshold})")
     elif args.cmd == "uninstall":
         print(f"removed cc-brain hooks from {uninstall()}")
     return 0

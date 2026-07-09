@@ -179,8 +179,13 @@ def requested_providers() -> list[str]:
     return ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
 
-def status() -> RuntimeStatus:
-    dirs = [] if device_mode() == "cpu" else preload_dlls()
+def status(preload: bool = True) -> RuntimeStatus:
+    if device_mode() == "cpu":
+        dirs = []
+    elif preload:
+        dirs = preload_dlls()
+    else:
+        dirs = [str(d) for d in _dll_dirs()]
     providers = ["CPUExecutionProvider"] if device_mode() == "cpu" else ["CUDAExecutionProvider", "CPUExecutionProvider"]
     return RuntimeStatus(
         device_mode=device_mode(),

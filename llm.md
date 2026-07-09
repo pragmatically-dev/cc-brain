@@ -290,6 +290,10 @@ Healthy `doctor` should show:
   before reusing a name).
 - `cc-brain project-state <project>` — deterministic resume context: newest
   session atom + recent commits + related chunks.
+- `cc-brain dedupe [--threshold 0.95] [--limit 50]` — report near-duplicate
+  chunks across different files by cosine similarity; read-only, never
+  deletes anything. `doctor()` also warns when a random 256-chunk sample has
+  more than 20 candidate duplicate pairs.
 - `cc-brain uninstall` — remove only cc-brain's hooks from
   `~/.claude/settings.json`.
 
@@ -306,6 +310,27 @@ the failure is recorded and surfaced instead of being swallowed: the next
 `doctor()`/`health()` report it under `last_refresh_error` and `warnings`.
 When you see it: run `index()` synchronously to get the full error, fix the
 cause, and confirm the warning clears on the next successful index.
+
+## Ranking model (v0.4)
+
+`search()` scores each fused candidate through six terms, in order:
+
+1. `1/(60+rank)` — reciprocal-rank fusion of the BM25 and vector search
+   rankings; fuses two incomparable score scales without calibration.
+2. `+0.02 * trust` — static per-source authority bonus (curated notes are
+   trusted more than raw ingest).
+3. `+0.015 * exp(-ln2 * age_days / half_life(source))` — recency decay, with
+   a half-life resolved per source name first, then per source kind (a
+   session transcript decays in days; a curated note barely decays at all).
+4. `+min(0.01 * ln(1+uses), 0.04)` — implicit feedback: chunks actually
+   pulled into context via `get()` after a `search()` rank higher, capped so
+   old, frequently-reused chunks can't dominate genuine relevance.
+5. `+0.05 * PPR` — personalized PageRank over the memory graph (`edges`:
+   intra-file chunk chains, `[[wikilinks]]`, same-session temporal links)
+   rewards chunks that are structurally well-connected, not just textually
+   similar.
+6. MMR (`lambda=0.75`) reorders the top candidates for diversity, then a
+   per-path cap keeps any single file from crowding out the rest.
 
 ## Hard Usage Rules For Future Claude Sessions
 
