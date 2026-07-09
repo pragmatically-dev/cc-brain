@@ -13,6 +13,7 @@ def connect(p: BrainPaths | None = None) -> sqlite3.Connection:
     p = ensure_dirs(p or paths())
     con = sqlite3.connect(p.db)
     con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=5000")
     con.execute("PRAGMA foreign_keys=ON")
     con.executescript(
         """
@@ -79,6 +80,15 @@ def clear_dirty(p: BrainPaths | None = None) -> None:
         p.dirty.unlink()
     except FileNotFoundError:
         pass
+
+
+def meta_get(con, key: str, default: str = "") -> str:
+    row = con.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def meta_set(con, key: str, value: str) -> None:
+    con.execute("INSERT OR REPLACE INTO meta(k, v) VALUES(?,?)", (key, str(value)))
 
 
 def atomic_json(path: Path, payload) -> None:

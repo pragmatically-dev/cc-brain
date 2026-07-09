@@ -4,18 +4,32 @@ import re
 from pathlib import Path
 
 
-SECRET_RE = re.compile(
-    r"(AQ\.[\w\-]{10,}|nvapi-[\w\-]{10,}|AIza[\w\-]{20,}|sk-[A-Za-z0-9]{20,}|"
-    r"gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[\w\-]{10,})"
+SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
+    re.compile(
+        r"(AQ\.[\w\-]{10,}|nvapi-[\w\-]{10,}|AIza[\w\-]{20,}|sk-[A-Za-z0-9\-_]{20,}|"
+        r"gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[\w\-]{10,}|AKIA[0-9A-Z]{16})"
+    ),
+    re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)\b(\s*[=:]\s*)([\"']?)[^\s\"',;]{8,}\3"),
+    re.compile(r"\b([a-z][a-z0-9+.\-]*://[^\s:@/]+):([^\s@/]+)@"),
 )
+SECRET_RE = SECRET_PATTERNS[1]
 WORD_RE = re.compile(r"[A-Za-z0-9_]{2,}")
 URL_RE = re.compile(r"https?://[^\s)\]}>\"']+")
 MAX_CHUNK = 1800
 CODE_WINDOW = 80
+CODE_OVERLAP = 20
 
 
 def scrub(text: str) -> str:
-    return SECRET_RE.sub("[REDACTED]", text or "")
+    out = text or ""
+    out = SECRET_PATTERNS[0].sub("[REDACTED-KEY-BLOCK]", out)
+    out = SECRET_PATTERNS[1].sub("[REDACTED]", out)
+    out = SECRET_PATTERNS[2].sub("[REDACTED-JWT]", out)
+    out = SECRET_PATTERNS[3].sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", out)
+    out = SECRET_PATTERNS[4].sub(lambda m: f"{m.group(1)}:[REDACTED]@", out)
+    return out
 
 
 def tokenize(text: str) -> list[str]:
@@ -71,10 +85,16 @@ def chunk_markdown(text: str):
 
 def chunk_code(text: str):
     lines = text.split("\n")
-    for start in range(0, len(lines), CODE_WINDOW):
-        body = "\n".join(lines[start:start + CODE_WINDOW])
+    step = CODE_WINDOW - CODE_OVERLAP
+    start = 0
+    while start < len(lines):
+        end = min(start + CODE_WINDOW, len(lines))
+        body = "\n".join(lines[start:end])
         if body.strip():
-            yield (f"L{start + 1}-{min(start + CODE_WINDOW, len(lines))}", f"L{start + 1}", body)
+            yield (f"L{start + 1}-{end}", f"L{start + 1}", body)
+        if end >= len(lines):
+            break
+        start += step
 
 
 def chunk_file(path: Path, text: str):
