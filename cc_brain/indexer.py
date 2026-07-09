@@ -23,6 +23,16 @@ _MODEL = None
 _DIM = None
 _EMBEDDER = None
 
+# Recency half-life (days) per SourceSpec.kind. Only "md" (notes/commits/
+# sessions/web) and "code" (private-ingest/register_repo) exist as real kinds
+# today -- see config.py's _default_sources(). Curated/reference code ages
+# much slower than captured markdown, so it gets a much longer half-life;
+# "md" keeps the project's pre-v0.4 fixed 21-day decay so existing rankings
+# for the common case don't regress. Any future/custom kind falls back to the
+# spec's 30.0 default via .get().
+RECENCY_HALF_LIFE_DAYS: dict[str, float] = {"code": 90.0, "md": 21.0}
+_DEFAULT_RECENCY_HALF_LIFE_DAYS = 30.0
+
 
 def _supported_models() -> dict[str, int]:
     from fastembed import TextEmbedding
@@ -389,6 +399,47 @@ def _vec_search(query: str, limit: int, p: BrainPaths) -> list[tuple[int, float]
         return []
 
 
+def _mmr(
+    candidates: list[tuple[float, int, tuple]],
+    vecs: dict[int, "object"],
+    k: int,
+    lam: float = 0.75,
+) -> list[tuple[float, int, tuple]]:
+    """Greedy Maximal Marginal Relevance over a candidate pool.
+
+    `candidates` is a score-sorted list of (adjusted, cid, row); `vecs` maps
+    cid -> L2-normalized np.ndarray (missing cid = orthogonal, max_cos=0, it
+    is never excluded). Returns up to `k` items reordered to trade relevance
+    for diversity: argmax lam*rel_norm(c) - (1-lam)*max_cos(c, selected).
+    """
+    if not candidates:
+        return []
+    k = min(k, len(candidates))
+    scores = [adj for adj, _, _ in candidates]
+    lo, hi = min(scores), max(scores)
+    span = (hi - lo) or 1.0
+    rel_norm = {cid: (adj - lo) / span for adj, cid, _ in candidates}
+
+    remaining = list(candidates)
+    chosen: list[tuple[float, int, tuple]] = []
+    chosen_vecs: list = []
+    while remaining and len(chosen) < k:
+        best_i, best_val = 0, None
+        for i, (_, cid, _row) in enumerate(remaining):
+            vec = vecs.get(cid)
+            if vec is None or not chosen_vecs:
+                max_cos = 0.0
+            else:
+                max_cos = max((float(vec @ cv) for cv in chosen_vecs if cv is not None), default=0.0)
+            val = lam * rel_norm[cid] - (1 - lam) * max_cos
+            if best_val is None or val > best_val:
+                best_val, best_i = val, i
+        picked = remaining.pop(best_i)
+        chosen.append(picked)
+        chosen_vecs.append(vecs.get(picked[1]))
+    return chosen
+
+
 def _allowed_ids(con, source: str, project: str) -> set[int] | None:
     if not source and not project:
         return None
@@ -424,6 +475,7 @@ def search(query: str, k: int = 6, source: str = "", project: str = "", lex: boo
     for rank, (cid, _) in enumerate(_bm25(con, tokenize(query), pool, project, source)):
         fused[cid] = fused.get(cid, 0.0) + 1.0 / (60 + rank)
     now = time.time()
+    kind_by_source = {s.name: s.kind for s in load_sources(p)}
     candidates: list[tuple[float, int, tuple]] = []
     for cid, score in fused.items():
         row = con.execute(
@@ -436,9 +488,30 @@ def search(query: str, k: int = 6, source: str = "", project: str = "", lex: boo
         if project and normalize_project(project) != normalize_project(row[5] or ""):
             continue
         age_days = max(0.0, (now - float(row[7] or 0.0)) / 86400.0) if row[7] else 999.0
-        adjusted = float(score) + 0.02 * float(row[6] or 1.0) + 0.015 * math.exp(-age_days / 21.0)
+        half_life = RECENCY_HALF_LIFE_DAYS.get(kind_by_source.get(row[0], ""), _DEFAULT_RECENCY_HALF_LIFE_DAYS)
+        adjusted = float(score) + 0.02 * float(row[6] or 1.0) + 0.015 * math.exp(-math.log(2) * age_days / half_life)
         candidates.append((adjusted, cid, row))
     candidates.sort(key=lambda x: -x[0])
+
+    if not lex and candidates:
+        pool_n = min(len(candidates), 4 * k)
+        mmr_pool = candidates[:pool_n]
+        tail = candidates[pool_n:]
+        vecs: dict[int, "object"] = {}
+        pool_cids = [cid for _, cid, _ in mmr_pool]
+        if pool_cids:
+            import numpy as np
+            placeholders = ",".join("?" * len(pool_cids))
+            for cid, raw in con.execute(f"SELECT chunk, vec FROM embeddings WHERE chunk IN ({placeholders})", pool_cids):
+                arr = np.frombuffer(raw, dtype=np.float32)
+                norm = float(np.linalg.norm(arr))
+                # Zero-norm (shouldn't happen for real embeddings) is kept as-is:
+                # its dot product with anything is 0, i.e. treated as orthogonal.
+                vecs[cid] = arr / norm if norm > 0 else arr
+        if vecs:
+            mmr_pool = _mmr(mmr_pool, vecs, k=len(mmr_pool), lam=0.75)
+        candidates = mmr_pool + tail
+
     out: list[SearchHit] = []
     per_path: dict[str, int] = {}
     for adjusted, cid, row in candidates:
