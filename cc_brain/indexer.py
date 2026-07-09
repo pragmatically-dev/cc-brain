@@ -333,7 +333,10 @@ def _bm25(con, tokens: list[str], limit: int, project: str = "", source: str = "
             rows = con.execute(q, args).fetchall()
         else:
             rows = con.execute("SELECT chunk, tf FROM postings WHERE term=?", (tok,)).fetchall()
-        if not rows or len(rows) > n * 0.5:
+        # Common-term pruning only makes sense at scale: in a small (often
+        # filtered) universe a term matching most docs is usually the target,
+        # not a stopword, so the 50% rule gets an absolute floor.
+        if not rows or len(rows) > max(n * 0.5, 16):
             continue
         idf = math.log(1 + (n - len(rows) + 0.5) / (len(rows) + 0.5))
         for cid, tf in rows:
@@ -499,7 +502,7 @@ def project_snapshot(project: str, k: int = 8, p: BrainPaths | None = None) -> s
     if commit_log.exists():
         tail = commit_log.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-12:]
         parts.append("## Recent commits\n" + "\n".join(tail))
-    hits = search(f"{proj} current status next step handoff", k=k, project=proj, lex=True)
+    hits = search(f"{proj} current status next step handoff", k=k, project=proj, lex=True, p=p)
     if hits:
         lines = [f"- [{h.id}] {h.source}:{h.path}#{h.loc} " + " ".join(h.text.split())[:200] for h in hits]
         parts.append("## Related chunks (use get(ids) to expand)\n" + "\n".join(lines))
