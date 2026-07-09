@@ -46,7 +46,28 @@ cc-brain search "current status next step" --project your-project
 After `cc-brain install`, hooks keep the brain current:
 
 - Session start registers the current repo.
-- Session end writes L0/L1 memory and marks the vault dirty.
+- Session end (and `PreCompact`, right before context compaction) writes L0/L1
+  memory and marks the vault dirty.
 - Edits and commits mark the project dirty.
 - WebFetch captures consulted pages into `ingest/web`.
-- MCP search indexes dirty sources before recall.
+- MCP tools trigger a non-blocking background index refresh when the vault is
+  dirty, instead of paying a synchronous reindex on every search.
+
+## Managing sources
+
+```powershell
+cc-brain sources
+cc-brain remove-source source-name
+```
+
+`remove-source` unregisters a source and deletes all of its chunks (and
+postings/embeddings) from the brain, then rebuilds the turbovec index.
+
+## Uninstalling hooks
+
+```powershell
+cc-brain uninstall
+```
+
+Removes only cc-brain's own entries from `~/.claude/settings.json`. Any other
+hooks configured there are left untouched.

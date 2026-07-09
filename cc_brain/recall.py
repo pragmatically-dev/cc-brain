@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 
 from . import indexer
-from .config import paths, project_from_path
+from .config import project_from_path
 
 
 def format_hits(hits, max_chars: int = 2800) -> str:

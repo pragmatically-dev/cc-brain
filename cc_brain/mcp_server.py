@@ -11,14 +11,14 @@ from .config import load_sources, paths
 from .indexer import doctor as run_doctor
 from .indexer import get as get_chunks
 from .indexer import index as run_index
-from .indexer import project_snapshot, register_repo, search as run_search
+from .indexer import project_snapshot, register_repo
 from .indexer import recent as run_recent
 from .indexer import remove_source as run_remove_source
+from .indexer import search as run_search
 from .indexer import stats as run_stats
 from .memory import write_note
 from .store import dirty_info
 from .web import capture_web
-
 
 mcp = FastMCP("cc-brain")
 _LOCK = threading.Lock()

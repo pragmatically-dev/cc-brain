@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 
 from . import __version__
 from .config import load_sources, paths
 from .indexer import doctor, get, index, project_snapshot, recent, register_repo, remove_source, search, stats
 from .installer import install, mcp_command, uninstall
 from .memory import capture_transcript, write_note
-from .runtime import status as runtime_status, vendor_gpu_runtime
+from .runtime import status as runtime_status
+from .runtime import vendor_gpu_runtime
 from .web import capture_web
 
 

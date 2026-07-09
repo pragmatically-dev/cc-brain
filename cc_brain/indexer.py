@@ -9,10 +9,10 @@ from pathlib import Path
 
 from .config import BrainPaths, load_sources, paths, project_from_path, slug, upsert_source
 from .contracts import SearchHit, SourceSpec
-from .runtime import device_mode, requested_providers, status as runtime_status
+from .runtime import device_mode, requested_providers
+from .runtime import status as runtime_status
 from .store import clear_dirty, connect, meta_get, meta_set
 from .text import chunk_file, tokenize
-
 
 _PREFERRED_MODELS = (
     "intfloat/multilingual-e5-large",

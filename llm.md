@@ -96,7 +96,13 @@ This updates `~/.claude/settings.json` with:
 - `SessionStart`
 - `UserPromptSubmit`
 - `SessionEnd`
+- `PreCompact`
 - `PostToolUse` for shell/edit/write/web tools
+
+Re-running `install` is idempotent: it updates an existing cc-brain hook entry
+in place (even one pointing at a stale Python path) instead of duplicating it.
+Run `cc-brain uninstall` to remove only cc-brain's own hook entries, leaving
+any unrelated hooks untouched.
 
 Verify the settings file exists and includes commands that run:
 
@@ -136,6 +142,9 @@ Expected MCP tools:
 - `add_repo`
 - `add_web`
 - `project_state`
+- `stats`
+- `recent`
+- `remove_source`
 
 ## Privacy Setup For Proprietary Code
 
@@ -241,6 +250,9 @@ After installation, tell Claude/agents to follow these rules:
 8. Do not dump huge files into context when a search/get drill-down will do.
 9. Do not rely on unindexed private folders; index `ingest/` first.
 10. If recall looks stale, run `doctor()` then `index()`.
+11. Prefer `project_state` (deterministic) at session resume over hoping a
+    lexical search happens to surface the right memory; use `stats()`/`recent()`
+    to check freshness before assuming the brain is stale.
 
 ## Completion Criteria
 

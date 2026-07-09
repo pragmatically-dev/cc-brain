@@ -90,6 +90,18 @@ cc-brain search "current status next step" --project your-project
 lane for exact identifiers, filenames, hashes and error strings. A BM25-only
 brain is considered unhealthy.
 
+## Embeddings
+
+`cc-brain` auto-selects an embedding model, preferring a multilingual model
+(`intfloat/multilingual-e5-large` when the installed `fastembed` supports it —
+important since a lot of session content is Spanish), falling back to an
+English-only model if no multilingual model is available. Override the choice
+with `CC_BRAIN_EMBED_MODEL` (and optionally `CC_BRAIN_EMBED_DIM`). Changing the
+model — whether by upgrading `fastembed` or setting the env var — is detected
+automatically: the next `index()` wipes stored embeddings and does a full
+re-embed of every chunk, so the turbovec index never mixes vectors from two
+different models.
+
 Required runtime dependencies are installed by the package:
 
 - `turbovec`
@@ -143,6 +155,7 @@ committing binary DLLs.
 | `SessionStart` | Registers the current repo and injects the last relevant project memory. |
 | `UserPromptSubmit` | Adds bounded lexical recall for the current prompt. |
 | `SessionEnd` | Captures transcript facts into L0/L1 memory and marks the vault dirty. |
+| `PreCompact` | Captures transcript facts before context compaction, same as `SessionEnd`. |
 | `PostToolUse` | Tracks edits, records successful commits, captures WebFetch outputs and marks repos dirty. |
 
 Hook failures exit `0`, so a bug in `cc-brain` should not break Claude Code.
@@ -166,13 +179,16 @@ Available MCP tools:
 | Tool | Purpose |
 | --- | --- |
 | `search(query, k=6, source='', project='', lex=False)` | Search the brain with turbovec+BM25 hybrid retrieval. |
-| `get(ids)` | Expand selected chunk ids to full text. |
+| `get(ids)` | Expand selected chunk ids to full text (capped at 24 ids). |
 | `note(name, content)` | Save durable curated knowledge. |
 | `index(rebuild=False)` | Index all registered sources. |
 | `sources()` | List registered sources. |
 | `add_repo(path, name='', project='')` | Register a local repo or folder. |
 | `add_web(url, project='')` | Fetch and store a web page into the local brain. |
-| `project_state(project, k=8)` | Retrieve likely current status/handoff chunks for a project. |
+| `project_state(project, k=8)` | Deterministic freshest project memory: newest session atom + recent commits + related chunks, not a hope-the-search-finds-it lookup. |
+| `stats()` | Brain size and freshness: chunks per source/project, embedding model, last index time. |
+| `recent(project='', limit=10)` | Most recently indexed files, newest first — a quick freshness probe. |
+| `remove_source(name)` | Unregister a source and delete its chunks from the brain. |
 | `doctor()` / `health()` | Inspect sources, embeddings, providers and recommendations. |
 | `ping()` | Fast liveness check. |
 
@@ -188,9 +204,15 @@ cc-brain add-repo C:\repo --name repo-name --project project-name
 cc-brain add-web https://example.com/doc --project project-name
 cc-brain note decision-name "Important decision text"
 cc-brain capture C:\path\to\transcript.jsonl --cwd C:\repo
+cc-brain stats
+cc-brain recent [--project name] [-n 10]
+cc-brain remove-source source-name
+cc-brain notes
+cc-brain project-state project-name
 cc-brain bootstrap-gpu
 cc-brain privacy-env
 cc-brain install
+cc-brain uninstall
 cc-brain mcp-command
 ```
 

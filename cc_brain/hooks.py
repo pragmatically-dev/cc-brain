@@ -14,7 +14,6 @@ from .recall import prompt_context, session_start_context
 from .store import mark_dirty
 from .web import capture_web
 
-
 COMMIT_RE = re.compile(r"\[(\S+)\s+(?:\(root-commit\)\s+)?([0-9a-f]{7,40})\]\s*(.*)")
 
 

@@ -8,7 +8,6 @@ from pathlib import Path
 
 from .contracts import SourceSpec
 
-
 DEFAULT_INCLUDE = SourceSpec("x", Path(".")).include
 DEFAULT_EXCLUDE = SourceSpec("x", Path(".")).exclude
 
