@@ -50,7 +50,7 @@ class HookPayload:
     source: str = ""
     tool_name: str = ""
     tool_input: dict = field(default_factory=dict)
-    tool_output: object = None
+    tool_response: object = None
     session_id: str = ""
 
 

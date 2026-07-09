@@ -65,9 +65,12 @@ def parse(path: str | Path) -> dict:
                 if data.get("isMeta") or data.get("isSidechain") or data.get("isCompactSummary"):
                     continue
                 for kind, block in _blocks(data.get("message", {})):
-                    if kind != "str":
+                    if kind == "str":
+                        text = block.strip()
+                    elif kind == "text" and isinstance(block, dict):
+                        text = (block.get("text") or "").strip()
+                    else:
                         continue
-                    text = block.strip()
                     norm = " ".join(text.split()).lower()[:240]
                     if len(text) > 2 and not text.startswith(INJECTED_PREFIXES) and norm not in seen_asks:
                         info["user_requests"].append(scrub(text)[:700])

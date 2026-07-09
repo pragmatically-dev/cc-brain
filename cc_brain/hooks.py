@@ -28,13 +28,22 @@ def _payload() -> dict:
     return json.loads(raw) if raw.strip() else {}
 
 
+def _tool_output(data: dict):
+    return data.get("tool_response", data.get("tool_output"))
+
+
 def _register_cwd(cwd: str) -> None:
     if not cwd:
         return
     root = Path(cwd)
-    if root.exists() and root.is_dir():
-        register_repo(root, name=f"repo-{root.name}", project=root.name)
-        mark_dirty("repo-seen", root)
+    if not (root.exists() and root.is_dir()):
+        return
+    from .config import load_sources
+    name = slug(f"repo-{root.name}")
+    if any(s.name == name for s in load_sources()):
+        return
+    register_repo(root, name=f"repo-{root.name}", project=root.name)
+    mark_dirty("repo-new", root)
 
 
 def session_start(data: dict) -> None:
@@ -67,7 +76,7 @@ def post_tool_use(data: dict) -> None:
         return
     if tool in ("WebFetch", "webfetch"):
         url = tool_input.get("url") or ""
-        output = data.get("tool_output") or ""
+        output = _tool_output(data) or ""
         if isinstance(output, dict):
             output = output.get("stdout") or output.get("content") or json.dumps(output, ensure_ascii=False)
         if url:
@@ -77,7 +86,7 @@ def post_tool_use(data: dict) -> None:
         return
     cmd = tool_input.get("command", "") or ""
     if "git commit" in cmd:
-        out = data.get("tool_output") or ""
+        out = _tool_output(data) or ""
         if isinstance(out, dict):
             out = out.get("stdout", "") or json.dumps(out)
         m = COMMIT_RE.search(str(out))
@@ -98,10 +107,15 @@ def post_tool_use(data: dict) -> None:
 def main() -> int:
     ensure_dirs(paths())
     data = _payload()
+    if os.environ.get("CC_BRAIN_DEBUG"):
+        log_dir = paths().home / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with (log_dir / "hooks.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, ensure_ascii=False, default=str) + "\n")
     event = data.get("hook_event_name", "")
     if event == "UserPromptSubmit":
         user_prompt_submit(data)
-    elif event == "SessionEnd":
+    elif event in ("SessionEnd", "PreCompact"):
         session_end(data)
     elif event == "PostToolUse":
         post_tool_use(data)
