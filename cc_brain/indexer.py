@@ -306,6 +306,9 @@ def index(rebuild: bool = False, p: BrainPaths | None = None) -> str:
     else:
         vector_note = "[index] vector: unchanged, rebuild skipped"
 
+    if changed or removed or rebuild or model_changed:
+        _rebuild_edges(con)
+
     meta_set(con, "embed_model", embed_model())
     meta_set(con, "embed_dim", str(embed_dim()))
     meta_set(con, "last_index", str(time.time()))
@@ -344,6 +347,89 @@ def _rebuild_turbovec(con, p: BrainPaths) -> None:
     }), encoding="utf-8")
     os.replace(tv_tmp, p.tv)
     os.replace(ids_tmp, p.ids)
+
+
+_WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
+
+
+def _rebuild_edges(con) -> None:
+    """Full rebuild of the memory graph (`edges` table) from `chunks`.
+
+    Always a total rebuild, never incremental: when a file changes, its
+    chunks are deleted and re-inserted with brand-new autoincrement ids, so
+    an incremental "delete just this file's old edges" pass would leave
+    dangling edges pointing at dead cids, and the inter-file temporal chain
+    would also go stale. At this scale (thousands of chunks) a full rebuild
+    from one ordered SELECT is cheap and trivially correct.
+    """
+    con.execute("DELETE FROM edges")
+    rows = con.execute(
+        "SELECT id, path, source, mtime, text FROM chunks ORDER BY source, path, id"
+    ).fetchall()
+    if not rows:
+        con.commit()
+        return
+
+    edges: dict[tuple[int, int], float] = {}
+
+    def add_edge(a: int, b: int, w: float) -> None:
+        if a == b:
+            return
+        key = (a, b) if a < b else (b, a)
+        if edges.get(key, -1.0) < w:
+            edges[key] = w
+
+    first_id: dict[tuple[str, str], int] = {}       # (source, path) -> first chunk id
+    min_mtime: dict[tuple[str, str], float] = {}     # (source, path) -> min mtime
+    notes_filename_to_first_id: dict[str, int] = {}  # filename -> first chunk id (source == "notes")
+
+    prev_path = None
+    prev_id = None
+    for cid, path, source, mtime, _text in rows:
+        key = (source, path)
+        if key not in first_id:
+            first_id[key] = cid
+            min_mtime[key] = mtime or 0.0
+            if source == "notes":
+                notes_filename_to_first_id[Path(path).name] = cid
+        else:
+            min_mtime[key] = min(min_mtime[key], mtime or 0.0)
+        # a) intra-file chain: rows are ordered by (source, path, id), so
+        # "same path as the previous row" means "consecutive chunk in the
+        # same file".
+        if path == prev_path:
+            add_edge(prev_id, cid, 1.0)
+        prev_path, prev_id = path, cid
+
+    # b) inter-file temporal chain, per source: order that source's files by
+    # their earliest chunk's mtime, link consecutive files within 1h (edge
+    # between each file's first chunk).
+    by_source: dict[str, list[tuple[float, int]]] = {}
+    for (source, path), fid in first_id.items():
+        by_source.setdefault(source, []).append((min_mtime[(source, path)], fid))
+    for items in by_source.values():
+        items.sort(key=lambda x: x[0])
+        for (mtime_a, id_a), (mtime_b, id_b) in zip(items, items[1:]):
+            if abs(mtime_b - mtime_a) < 3600:
+                add_edge(id_a, id_b, 0.5)
+
+    # c) wikilinks: only from "notes" chunks, [[name]] -> first chunk of the
+    # notes file whose filename is slug(name) + ".md". Silent skip if the
+    # target doesn't exist (dangling wikilink).
+    for cid, path, source, mtime, text in rows:
+        if source != "notes" or not text:
+            continue
+        for m in _WIKILINK_RE.finditer(text):
+            target_name = slug(m.group(1).strip()) + ".md"
+            target_id = notes_filename_to_first_id.get(target_name)
+            if target_id is not None:
+                add_edge(cid, target_id, 2.0)
+
+    con.executemany(
+        "INSERT OR REPLACE INTO edges(a, b, w) VALUES(?,?,?)",
+        [(a, b, w) for (a, b), w in edges.items()],
+    )
+    con.commit()
 
 
 def _bm25(con, tokens: list[str], limit: int, project: str = "", source: str = "") -> list[tuple[int, float]]:
@@ -470,6 +556,112 @@ def _mmr(
     return chosen
 
 
+def _personalized_pagerank(
+    nodes: list[int],
+    edges: list[tuple[int, int, float]],
+    teleport: dict[int, float],
+    iters: int = 8,
+    damping: float = 0.85,
+) -> dict[int, float]:
+    """Personalized PageRank over a small dense subgraph.
+
+    `nodes` fixes the node set/order; `edges` are undirected (a, b, w) pairs
+    (endpoints outside `nodes` are ignored); `teleport` maps node -> restart
+    mass (missing = 0), renormalized to sum to 1 (uniform if empty/all-zero).
+    The transition matrix is column-stochastic; mass sitting in zero-degree
+    (dangling) columns doesn't vanish -- it's redistributed through the
+    teleport vector on every iteration, same as the damping term. Returns
+    node -> stationary score (not necessarily normalized/comparable across
+    calls; callers min-max it over the subgraph before blending).
+    """
+    n = len(nodes)
+    if n == 0:
+        return {}
+    import numpy as np
+    idx = {node: i for i, node in enumerate(nodes)}
+    w = np.zeros((n, n), dtype=np.float64)
+    for a, b, weight in edges:
+        if a == b or a not in idx or b not in idx:
+            continue
+        i, j = idx[a], idx[b]
+        w[i, j] += weight
+        w[j, i] += weight
+    col_sums = w.sum(axis=0)
+    dangling = col_sums == 0
+    safe_sums = np.where(dangling, 1.0, col_sums)
+    w_norm = w / safe_sums
+
+    t = np.zeros(n, dtype=np.float64)
+    for node, mass in teleport.items():
+        if node in idx:
+            t[idx[node]] = mass
+    t_sum = t.sum()
+    t = (t / t_sum) if t_sum > 0 else np.full(n, 1.0 / n, dtype=np.float64)
+
+    r = t.copy()
+    for _ in range(iters):
+        wr = w_norm @ r
+        dangling_mass = float(r[dangling].sum()) if dangling.any() else 0.0
+        r = damping * (wr + dangling_mass * t) + (1 - damping) * t
+    return {node: float(r[idx[node]]) for node in nodes}
+
+
+_PPR_NODE_CAP = 512
+_PPR_BLEND_WEIGHT = 0.05
+
+
+def _blend_personalized_pagerank(con, fused: dict[int, float]) -> None:
+    """Blend a personalized-PageRank signal into `fused`, in place.
+
+    Nodes = fused candidates + their 1-hop memory-graph neighbors (one SELECT,
+    capped at 512 nodes total -- fused candidates are always kept, neighbors
+    are added by descending edge weight if there's room). Teleport mass is
+    the fused scores normalized to sum to 1 (0 for pure neighbors). Only
+    cids that were already in `fused` get the blended bonus: pure neighbors
+    never become new candidates here, so the source/project filters already
+    applied downstream in search() stay meaningful.
+    """
+    fused_cids = list(fused.keys())
+    placeholders = ",".join("?" * len(fused_cids))
+    edge_rows = con.execute(
+        f"SELECT a, b, w FROM edges WHERE a IN ({placeholders}) OR b IN ({placeholders})",
+        fused_cids + fused_cids,
+    ).fetchall()
+    if not edge_rows:
+        return
+
+    fused_set = set(fused_cids)
+    neighbor_w: dict[int, float] = {}
+    for a, b, wt in edge_rows:
+        for x in (a, b):
+            if x not in fused_set:
+                neighbor_w[x] = max(neighbor_w.get(x, 0.0), wt)
+
+    nodes = list(fused_cids)
+    budget = _PPR_NODE_CAP - len(nodes)
+    if budget > 0 and neighbor_w:
+        extra = sorted(neighbor_w.items(), key=lambda kv: -kv[1])[:budget]
+        nodes.extend(cid for cid, _ in extra)
+    elif budget < 0:
+        nodes = nodes[:_PPR_NODE_CAP]
+    node_set = set(nodes)
+
+    edge_list = [(a, b, wt) for a, b, wt in edge_rows if a in node_set and b in node_set]
+
+    total = sum(fused.values())
+    teleport = {cid: score / total for cid, score in fused.items() if cid in node_set} if total > 0 else {}
+
+    ppr = _personalized_pagerank(nodes, edge_list, teleport)
+    if not ppr:
+        return
+    values = list(ppr.values())
+    lo, hi = min(values), max(values)
+    span = (hi - lo) or 1.0
+    for cid in fused_cids:
+        if cid in ppr:
+            fused[cid] += _PPR_BLEND_WEIGHT * ((ppr[cid] - lo) / span)
+
+
 def _allowed_ids(con, source: str, project: str) -> set[int] | None:
     if not source and not project:
         return None
@@ -504,6 +696,10 @@ def search(query: str, k: int = 6, source: str = "", project: str = "", lex: boo
                 break
     for rank, (cid, _) in enumerate(_bm25(con, tokenize(query), pool, project, source)):
         fused[cid] = fused.get(cid, 0.0) + 1.0 / (60 + rank)
+
+    if fused and con.execute("SELECT 1 FROM edges LIMIT 1").fetchone():
+        _blend_personalized_pagerank(con, fused)
+
     now = time.time()
     kind_by_source = {s.name: s.kind for s in load_sources(p)}
     candidates: list[tuple[float, int, tuple]] = []

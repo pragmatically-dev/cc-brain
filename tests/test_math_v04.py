@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -281,3 +282,169 @@ def test_legacy_db_without_uses_column_migrates_on_connect(brain_home):
     con = connect(p)
     row = con.execute("SELECT uses FROM chunks WHERE id=1").fetchone()
     assert row == (0,), "legacy chunks row must get uses=0 via the tolerant ALTER TABLE migration"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 -- memory graph (edges) + personalized PageRank blend
+#
+# Design deviations from the original spec, per supervisor direction:
+#  1. Edges are ALWAYS fully rebuilt at the end of index() when anything
+#     changed (changed/removed/rebuild/model_changed), never incrementally.
+#     A changed file's chunks are deleted and re-inserted with brand-new
+#     autoincrement ids, so "delete just this file's edges" would leave
+#     dangling edges at dead cids and stale inter-file temporal links. Full
+#     rebuild is cheap and trivially correct at this scale.
+#  2. Edge construction is one ordered SELECT (source, path, id) producing
+#     three rule sets: intra-file chain (w=1.0), inter-file temporal chain
+#     per source within 1h (w=0.5, between each file's first chunk), and
+#     notes-only [[wikilinks]] (w=2.0, chunk -> target file's first chunk).
+# ---------------------------------------------------------------------------
+
+class _FakeEmbedder:
+    def __init__(self, dim):
+        self.dim = dim
+
+    def embed(self, texts):
+        return [np.ones(self.dim, dtype=np.float32) for _ in texts]
+
+
+@pytest.fixture()
+def edge_index_env(brain_home, monkeypatch):
+    """Deterministic embedder, no turbovec/fastembed -- lets real index() run
+    (to exercise the edges-rebuild trigger, incl. chunk delete/reinsert on
+    file change) without touching the real embedding stack."""
+    monkeypatch.setattr(indexer, "embed_model", lambda: "fake-model")
+    monkeypatch.setattr(indexer, "embed_dim", lambda: 4)
+    monkeypatch.setattr(indexer, "_embedder", lambda: _FakeEmbedder(4))
+    monkeypatch.setattr(indexer, "_rebuild_turbovec", lambda con, p: None)
+    return brain_home
+
+
+def _write_md(path: Path, sections: list[tuple[str, str]]) -> None:
+    body = "\n\n".join(f"## {title}\n{text}" for title, text in sections)
+    path.write_text(body, encoding="utf-8")
+
+
+def test_index_builds_intra_file_chain_and_no_dangling_edges_after_reindex(edge_index_env):
+    p = edge_index_env
+    p.notes.mkdir(parents=True, exist_ok=True)
+    f1 = p.notes / "file1.md"
+    f2 = p.notes / "file2.md"
+    _write_md(f1, [("A", "alpha one"), ("B", "alpha two"), ("C", "alpha three")])
+    _write_md(f2, [("D", "beta one"), ("E", "beta two"), ("F", "beta three")])
+
+    indexer.index(p=p)
+
+    con = connect(p)
+    ids_f1 = [r[0] for r in con.execute("SELECT id FROM chunks WHERE path=? ORDER BY id", (str(f1),))]
+    assert len(ids_f1) == 3
+    a, b, c = ids_f1
+    assert con.execute("SELECT w FROM edges WHERE a=? AND b=?", (a, b)).fetchone() == (1.0,)
+    assert con.execute("SELECT w FROM edges WHERE a=? AND b=?", (b, c)).fetchone() == (1.0,)
+
+    # Modify file1 so its chunks are deleted and reinserted with brand-new ids.
+    _write_md(f1, [("A2", "alpha ONE changed"), ("B2", "alpha two"), ("C2", "alpha three")])
+    indexer.index(p=p)
+
+    con = connect(p)
+    dangling = con.execute(
+        "SELECT COUNT(*) FROM edges WHERE a NOT IN (SELECT id FROM chunks) OR b NOT IN (SELECT id FROM chunks)"
+    ).fetchone()[0]
+    assert dangling == 0, "no edge may reference a chunk id that no longer exists after reindex"
+    assert a not in {r[0] for r in con.execute("SELECT id FROM chunks")}, "old file1 chunk ids must be gone"
+
+
+def test_wikilink_creates_edge_to_target_first_chunk(edge_index_env):
+    p = edge_index_env
+    p.notes.mkdir(parents=True, exist_ok=True)
+    target = p.notes / "target.md"
+    linker = p.notes / "linker.md"
+    _write_md(target, [("Target Note", "This is the target body.")])
+    _write_md(linker, [("Linker", "See [[target]] for details."), ("More", "second section")])
+
+    indexer.index(p=p)
+
+    con = connect(p)
+    target_first_id = con.execute(
+        "SELECT id FROM chunks WHERE path=? ORDER BY id LIMIT 1", (str(target),)
+    ).fetchone()[0]
+    linker_chunk_id = con.execute(
+        "SELECT id FROM chunks WHERE path=? AND text LIKE '%[[target]]%'", (str(linker),)
+    ).fetchone()[0]
+
+    a, b = sorted((linker_chunk_id, target_first_id))
+    row = con.execute("SELECT w FROM edges WHERE a=? AND b=?", (a, b)).fetchone()
+    assert row == (2.0,), f"expected a w=2.0 wikilink edge between {linker_chunk_id} and {target_first_id}, got {row}"
+
+
+def test_ppr_blend_boosts_node_with_reinforcing_neighbor(brain_home, monkeypatch):
+    """Synthetic graph: A(1)-B(2) strong edge, B is never a search candidate
+    itself; C(3) is isolated. A and C start with an equal fused RRF score
+    (one RRF leg each). cid 3 is inserted into the fused dict first (vec leg)
+    so a pre-fix tie would stable-sort it first -- must flip to [1, 3] once
+    the PPR blend is active, since B continuously feeds mass back to A while
+    isolated C only ever gets flat teleport mass."""
+    p = brain_home
+    con = connect(p)
+    now = time.time()
+    make_chunk(con, 1, "notes", "", "node A", trust=1.0, mtime=now, path="a.md")
+    make_chunk(con, 2, "notes", "", "node B", trust=1.0, mtime=now, path="b.md")
+    make_chunk(con, 3, "notes", "", "node C", trust=1.0, mtime=now, path="c.md")
+    con.commit()
+    con.execute("INSERT INTO edges(a, b, w) VALUES(1, 2, 5.0)")
+    con.commit()
+
+    monkeypatch.setattr(indexer, "_vec_search", lambda query, limit, p: [(3, 0.0)])
+    monkeypatch.setattr(indexer, "_bm25", lambda con, tokens, limit, project="", source="": [(1, 0.0)])
+
+    hits = indexer.search("q", k=2, p=p)
+    ids = [h.id for h in hits]
+
+    assert ids == [1, 3], f"A (reinforced via neighbor B) should outrank isolated C, got {ids}"
+    assert 2 not in ids, "B was never a fused candidate and must not appear as a result"
+
+
+def test_no_regression_when_edges_present_but_unrelated_to_candidates(brain_home, monkeypatch):
+    """With the edges table non-empty but containing no edge touching any
+    fused candidate, the PPR blend must be a strict no-op: ranking must match
+    the edges-table-empty case exactly, for the same seed data."""
+    p = brain_home
+    con = connect(p)
+    now = time.time()
+    make_chunk(con, 1, "notes", "", "alpha", trust=1.0, mtime=now, path="a.md")
+    make_chunk(con, 2, "notes", "", "beta", trust=1.2, mtime=now - 5 * 86400, path="b.md")
+    make_chunk(con, 3, "sessions", "", "gamma", trust=1.0, mtime=now - 40 * 86400, path="c.md")
+    con.commit()
+
+    monkeypatch.setattr(indexer, "_vec_search", lambda query, limit, p: [(1, 0.0), (2, 0.0)])
+    monkeypatch.setattr(indexer, "_bm25", lambda con, tokens, limit, project="", source="": [(3, 0.0)])
+
+    assert con.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0
+    baseline = [h.id for h in indexer.search("q", k=3, p=p)]
+
+    # Neither endpoint of this edge is a fused candidate (98/99 don't even
+    # exist as chunks) -- the neighbor lookup for {1,2,3} must return nothing.
+    con.execute("INSERT INTO edges(a, b, w) VALUES(98, 99, 1.0)")
+    con.commit()
+
+    with_unrelated_edges = [h.id for h in indexer.search("q", k=3, p=p)]
+    assert with_unrelated_edges == baseline
+
+
+def test_personalized_pagerank_no_edges_converges_to_teleport():
+    teleport = {1: 0.5, 2: 0.0, 3: 0.5}
+    result = indexer._personalized_pagerank([1, 2, 3], [], teleport, iters=8, damping=0.85)
+    assert result[1] == pytest.approx(0.5)
+    assert result[2] == pytest.approx(0.0)
+    assert result[3] == pytest.approx(0.5)
+
+
+def test_personalized_pagerank_hand_calculable_one_iteration():
+    # nodes 1=A, 2=B, 3=C; edge A-B w=1.0; C isolated; teleport split A/C.
+    # By hand: W_norm = [[0,1,0],[1,0,0],[0,0,0]] (idx order A,B,C); r0=t=[.5,0,.5].
+    # Wr = [0, .5, 0]; dangling_mass = r0[C] = .5.
+    # r1 = 0.85*([0,.5,0] + .5*[.5,0,.5]) + 0.15*[.5,0,.5] = [.2875, .425, .2875]
+    result = indexer._personalized_pagerank([1, 2, 3], [(1, 2, 1.0)], {1: 0.5, 3: 0.5}, iters=1, damping=0.85)
+    assert result[1] == pytest.approx(0.2875)
+    assert result[2] == pytest.approx(0.425)
+    assert result[3] == pytest.approx(0.2875)

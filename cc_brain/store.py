@@ -54,6 +54,13 @@ def connect(p: BrainPaths | None = None) -> sqlite3.Connection:
             k TEXT PRIMARY KEY,
             v TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS edges(
+            a INTEGER NOT NULL,
+            b INTEGER NOT NULL,
+            w REAL NOT NULL,
+            PRIMARY KEY(a, b)
+        );
+        CREATE INDEX IF NOT EXISTS idx_edges_b ON edges(b);
         """
     )
     # Pre-v0.4 DBs have a chunks table without `uses`; CREATE TABLE IF NOT
