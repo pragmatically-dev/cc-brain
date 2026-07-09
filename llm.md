@@ -83,6 +83,30 @@ If the user forbids network downloads:
 $env:CC_BRAIN_AUTO_VENDOR = "0"
 ```
 
+## Embedding Model
+
+The default model is auto-selected, preferring multilingual
+(`intfloat/multilingual-e5-large` when the installed fastembed supports it).
+This matters for non-English sessions: an English-only model degrades semantic
+recall over Spanish (or other) transcripts and notes.
+
+Override model or dimension explicitly:
+
+```powershell
+$env:CC_BRAIN_EMBED_MODEL = "BAAI/bge-base-en-v1.5"  # example: force old English default
+$env:CC_BRAIN_EMBED_DIM = "768"                       # only if the model needs it
+```
+
+Two things to tell the user up front:
+
+1. The first `cc-brain index` downloads the embedding model (the multilingual
+   default is large). If downloads are forbidden, set a smaller/pinned model
+   first.
+2. Changing the model later is safe: cc-brain records the model in its index
+   metadata and the next `index()` automatically re-embeds everything. `doctor`
+   reports a warning while model and index are out of sync. Never mix — do not
+   hand-edit the database to skip the re-embed.
+
 ## Install Hooks
 
 Run:
@@ -222,17 +246,43 @@ Run:
 cc-brain sources
 cc-brain index
 cc-brain doctor
+cc-brain stats
 cc-brain search "current status next step" -k 5
+cc-brain project-state <project-name>
 ```
 
 Healthy `doctor` should show:
 
 - `vector_available: true`
 - `recommendation: ok`
+- `warnings: []` (a sidecar/embedding-count mismatch or a stale embed model
+  shows up here with the exact fix to run)
 - nonzero `chunks` after indexing
 - nonzero `embeddings` after indexing
 - `CUDAExecutionProvider` when GPU is available and mode is `auto` or `gpu`
 - `CPUExecutionProvider` when mode is `cpu`
+
+## Brain Maintenance Commands
+
+- `cc-brain stats` — chunks per source/project, index size, embed model, last
+  index time. First stop when recall looks off.
+- `cc-brain recent [--project name] [-n 10]` — most recently indexed files;
+  freshness probe.
+- `cc-brain remove-source <name>` — unregister a source and delete its chunks.
+  Use it to prune stale auto-registered repos (every cwd Claude runs in becomes
+  a `repo-<name>` source); do not let dead sources accumulate.
+- `cc-brain notes` — list saved notes (note names overwrite silently; check
+  before reusing a name).
+- `cc-brain project-state <project>` — deterministic resume context: newest
+  session atom + recent commits + related chunks.
+- `cc-brain uninstall` — remove only cc-brain's hooks from
+  `~/.claude/settings.json`.
+
+Note on freshness: when the vault is dirty, the MCP `search`/`project_state`
+tools trigger the reindex in the background and prepend a
+`(vault dirty: index refresh started in background...)` note. That is normal —
+do not treat it as an error; re-query a few seconds later if the result looks
+stale, or run `index()` explicitly for a synchronous refresh.
 
 ## Hard Usage Rules For Future Claude Sessions
 
@@ -305,7 +355,21 @@ to the active Python, and run:
 python -m cc_brain.hooks
 ```
 
-Fix paths; do not remove unrelated user hooks.
+Fix paths; do not remove unrelated user hooks. Re-running `cc-brain install`
+repairs a stale Python path in place.
+
+### Hooks run but nothing is captured
+
+Enable payload logging and reproduce:
+
+```powershell
+$env:CC_BRAIN_DEBUG = "1"
+```
+
+Every hook invocation then appends its raw payload to
+`~/.cc-brain/logs/hooks.jsonl`. Check that events arrive and that
+`transcript_path`/`tool_response` contain what capture expects. Unset the
+variable afterwards.
 
 ### MCP not visible
 
