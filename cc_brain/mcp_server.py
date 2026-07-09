@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 
 from . import __version__
 from .config import load_sources, paths
+from .config import paths as brain_paths
 from .indexer import doctor as run_doctor
 from .indexer import get as get_chunks
 from .indexer import index as run_index
@@ -17,7 +18,7 @@ from .indexer import remove_source as run_remove_source
 from .indexer import search as run_search
 from .indexer import stats as run_stats
 from .memory import write_note
-from .store import dirty_info
+from .store import connect, dirty_info, meta_get, meta_set
 from .web import capture_web
 
 mcp = FastMCP("cc-brain")
@@ -26,24 +27,48 @@ _LAST_INDEX = 0.0
 _REFRESHING = False
 
 
+def _record_refresh_error(message: str) -> None:
+    """Persist (or clear, with "") the last background refresh failure so it
+    survives process restarts and shows up in doctor()/health()."""
+    try:
+        con = connect(brain_paths())
+        meta_set(con, "last_refresh_error", message)
+        con.commit()
+    except Exception:
+        pass  # never let error bookkeeping take down the server
+
+
+def _refresh_warning() -> str:
+    try:
+        err = meta_get(connect(brain_paths()), "last_refresh_error")
+    except Exception:
+        return ""
+    if not err:
+        return ""
+    return f"(warning: last background index refresh FAILED: {err} — results may be stale; see doctor())"
+
+
 def _index_if_dirty() -> str:
     global _LAST_INDEX, _REFRESHING
+    warning = _refresh_warning()
     info = dirty_info()
     if not info or _REFRESHING or time.time() - _LAST_INDEX < 30:
-        return ""
+        return warning
     def _run():
         global _LAST_INDEX, _REFRESHING
         try:
             with _LOCK:
                 run_index()
                 _LAST_INDEX = time.time()
-        except Exception:
-            pass
+                _record_refresh_error("")
+        except Exception as exc:
+            _record_refresh_error(f"{type(exc).__name__}: {exc}")
         finally:
             _REFRESHING = False
     _REFRESHING = True
     threading.Thread(target=_run, daemon=True).start()
-    return "(vault dirty: index refresh started in background; results may be a few seconds stale)"
+    note = "(vault dirty: index refresh started in background; results may be a few seconds stale)"
+    return f"{warning}\n{note}" if warning else note
 
 
 @mcp.tool()

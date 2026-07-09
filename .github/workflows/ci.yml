@@ -23,3 +23,20 @@ jobs:
       - run: pip install -e . --no-deps
       - run: ruff check cc_brain tests
       - run: pytest -q
+  # Unit tests above mock the vector stack; this job proves the package can
+  # actually install with its real (mandatory) dependencies and import them.
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e .
+      - run: python -c "import cc_brain, mcp, fastembed, turbovec, numpy; print('imports ok')"
+      - run: python -m cc_brain doctor
+        env: {CC_BRAIN_DEVICE: cpu}

@@ -106,6 +106,12 @@ Two things to tell the user up front:
    metadata and the next `index()` automatically re-embeds everything. `doctor`
    reports a warning while model and index are out of sync. Never mix — do not
    hand-edit the database to skip the re-embed.
+3. Upgrading from a pre-v0.2 database is also safe: if embeddings exist but the
+   model metadata is missing (old versions never recorded it), or the stored
+   vector byte-length contradicts the current model dimension (e.g. a crashed
+   half-migration), the next `index()` treats it as a model change and re-embeds
+   everything. Expect the first index after an upgrade to take longer; that is
+   the migration, not a hang.
 
 ## Install Hooks
 
@@ -194,6 +200,12 @@ Also tell consumer-plan users to disable model improvement at:
 https://claude.ai/settings/data-privacy-controls
 ```
 
+Secret scrubbing: every indexed source (repos, `ingest/`, transcripts, web
+captures) is passed through the secret scrubber before chunks are persisted —
+API keys, tokens, JWTs, `password=`/`api_key=` assignments and URL credentials
+are stored as `[REDACTED]` and are not searchable. This is a safety net, not a
+license to index secrets: rotate anything that was committed to a repo.
+
 Important wording: `cc-brain` keeps its index local, but if Claude reads private
 code, selected snippets can still be sent to the configured model provider as
 prompt content. For strict proprietary-code requirements, prefer Team,
@@ -255,8 +267,11 @@ Healthy `doctor` should show:
 
 - `vector_available: true`
 - `recommendation: ok`
-- `warnings: []` (a sidecar/embedding-count mismatch or a stale embed model
-  shows up here with the exact fix to run)
+- `warnings: []` (a sidecar/embedding-count mismatch, a stale embed model,
+  a pre-v0.2 DB pending re-embed, or a failed background refresh shows up
+  here with the exact fix to run)
+- `last_refresh_error: ""` (non-empty means the last background reindex died —
+  run `index()` synchronously to reproduce and fix)
 - nonzero `chunks` after indexing
 - nonzero `embeddings` after indexing
 - `CUDAExecutionProvider` when GPU is available and mode is `auto` or `gpu`
@@ -283,6 +298,14 @@ tools trigger the reindex in the background and prepend a
 `(vault dirty: index refresh started in background...)` note. That is normal —
 do not treat it as an error; re-query a few seconds later if the result looks
 stale, or run `index()` explicitly for a synchronous refresh.
+
+If a background refresh FAILS (model download, CUDA, corrupt source, DB error),
+the failure is recorded and surfaced instead of being swallowed: the next
+`search()`/`project_state()` prepends a
+`(warning: last background index refresh FAILED: ...)` line, and
+`doctor()`/`health()` report it under `last_refresh_error` and `warnings`.
+When you see it: run `index()` synchronously to get the full error, fix the
+cause, and confirm the warning clears on the next successful index.
 
 ## Hard Usage Rules For Future Claude Sessions
 

@@ -12,7 +12,7 @@ from .contracts import SearchHit, SourceSpec
 from .runtime import device_mode, requested_providers
 from .runtime import status as runtime_status
 from .store import clear_dirty, connect, meta_get, meta_set
-from .text import chunk_file, tokenize
+from .text import chunk_file, scrub, tokenize
 
 _PREFERRED_MODELS = (
     "intfloat/multilingual-e5-large",
@@ -172,6 +172,17 @@ def index(rebuild: bool = False, p: BrainPaths | None = None) -> str:
     stored_model = meta_get(con, "embed_model")
     stored_dim = meta_get(con, "embed_dim")
     model_changed = bool(stored_model) and (stored_model != embed_model() or stored_dim != str(embed_dim()))
+    if not model_changed and con.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone():
+        if not stored_model:
+            # Pre-v0.2 DB: embeddings exist but the model was never recorded.
+            # Assume mismatch — mixing dimensions corrupts the turbovec rebuild.
+            model_changed = True
+        else:
+            # Metadata can lie after a crashed half-migration; the stored vector
+            # byte length is the ground truth for the dimension actually on disk.
+            sample = con.execute("SELECT vec FROM embeddings LIMIT 1").fetchone()
+            if sample and len(sample[0]) != embed_dim() * 4:
+                model_changed = True
     if model_changed:
         con.execute("DELETE FROM embeddings")
         con.commit()
@@ -206,7 +217,9 @@ def index(rebuild: bool = False, p: BrainPaths | None = None) -> str:
     new_chunks: list[tuple[int, str]] = []
     for src, full, st in changed:
         try:
-            text = full.read_text(encoding="utf-8", errors="replace")
+            # Scrub before chunking: secrets committed to indexed repos must
+            # never be persisted (they would resurface via get() into context).
+            text = scrub(full.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             continue
         if len(text) > 300_000:
@@ -563,6 +576,11 @@ def doctor(p: BrainPaths | None = None) -> dict:
     stored_model = meta_get(con, "embed_model")
     if stored_model and stored_model != embed_model():
         warnings.append(f"index built with {stored_model} but current model is {embed_model()}; next index() re-embeds everything")
+    if not stored_model and embedded:
+        warnings.append("embeddings exist but embed_model metadata is missing (pre-v0.2 DB); next index() re-embeds everything")
+    last_refresh_error = meta_get(con, "last_refresh_error")
+    if last_refresh_error:
+        warnings.append(f"last background index refresh FAILED: {last_refresh_error}")
     return {
         "home": str(p.home),
         "sources": len(sources),
@@ -579,6 +597,7 @@ def doctor(p: BrainPaths | None = None) -> dict:
         "provider_warning": provider_warning,
         "embed_model": embed_model(),
         "ids_count": ids_count,
+        "last_refresh_error": last_refresh_error,
         "warnings": warnings,
         "recommendation": "install turbovec dependencies" if not vec_ok else ("index" if total == 0 else "ok"),
     }
